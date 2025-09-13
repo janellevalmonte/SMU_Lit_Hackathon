@@ -1,114 +1,173 @@
+import pandas as pd
 import re
 import os
-import glob
-import argparse
-import pandas as pd
-import pdfplumber
-from sklearn.linear_model import LinearRegression
-import numpy as np
 
-# ---------- Utilities ----------
-def text_from_pdf(path):
-    text = []
-    with pdfplumber.open(path) as pdf:
-        for p in pdf.pages:
-            text.append(p.extract_text() or "")
-    return "\n".join(text)
+def parse_case_file(pdf_path):
+    """
+    Parses a single Syariah Court case PDF to extract relevant data.
+    """
+    case_data = {
+        'case_id': os.path.basename(pdf_path),
+        'husband_income': None,
+        'nafkah_iddah': None,
+        'mutaah': None,
+        'is_consent_order': False,
+        'is_high_income': False,
+        'is_outlier': False
+    }
 
-def normalize_number(s):
-    if s is None: return None
-    s = s.replace(',', '').strip()
-    m = re.search(r'[-+]?\d+(\.\d+)?', s)
-    return float(m.group()) if m else None
+    try:
+        with fitz.open(pdf_path) as doc:
+            full_text = ""
+            for page in doc:
+                full_text += page.get_text()
 
-# strong regex patterns with currency and commas
-RE_INCOME = re.compile(r'(?:income of|husband(?:\'s)? income|monthly income|income was)\s*[^\d\w\-]*([$\u20B9€£]?\s?[\d,]+(?:\.\d+)?)', re.I)
-RE_NAFKAH = re.compile(r'nafkah iddah\s*(?:awarded|granted|is|of|:)?\s*[^\d\w\-]*([$\u20B9€£]?\s?[\d,]+(?:\.\d+)?)', re.I)
-RE_MUTAAH = re.compile(r'mutaah\s*(?:awarded|granted|is|of|:)?\s*[^\d\w\-]*([$\u20B9€£]?\s?[\d,]+(?:\.\d+)?)', re.I)
-RE_CONSENT = re.compile(r'\bconsent order\b|\bconsent judgment\b', re.I)
+        # Regular expressions to find the data
+        # Note: These are example patterns and will likely need to be
+        # refined based on the actual document format.
+        income_match = re.search(r'Husband\'s income:\s*S?\$(\d{1,3}(?:,\d{3})*)', full_text, re.IGNORECASE)
+        nafkah_match = re.search(r'Nafkah Iddah awarded:\s*S?\$(\d{1,3}(?:,\d{3})*)', full_text, re.IGNORECASE)
+        mutaah_match = re.search(r'Mutaah awarded:\s*S?\$(\d{1,3}(?:,\d{3})*)', full_text, re.IGNORECASE)
+        consent_order_match = re.search(r'consent order', full_text, re.IGNORECASE)
+        
+        if income_match:
+            # Clean and convert to integer
+            case_data['husband_income'] = int(income_match.group(1).replace(',', ''))
+        if nafkah_match:
+            case_data['nafkah_iddah'] = int(nafkah_match.group(1).replace(',', ''))
+        if mutaah_match:
+            case_data['mutaah'] = int(mutaah_match.group(1).replace(',', ''))
+        if consent_order_match:
+            case_data['is_consent_order'] = True
 
-def find_first(pattern, text):
-    m = pattern.search(text)
-    return m.group(1) if m else None
+    except Exception as e:
+        print(f"Error processing {pdf_path}: {e}")
 
-# ---------- Pipeline ----------
-def process_file(path):
-    if path.lower().endswith('.pdf'):
-        text = text_from_pdf(path)
+    return case_data
+
+def process_case_files(directory):
+    """
+    Processes all PDF files in a given directory and returns a DataFrame.
+    """
+    all_case_data = []
+    
+    for filename in os.listdir(directory):
+        if filename.lower().endswith(".pdf"):
+            pdf_path = os.path.join(directory, filename)
+            data = parse_case_file(pdf_path)
+            all_case_data.append(data)
+
+    df = pd.DataFrame(all_case_data)
+    
+    # Apply filtering criteria
+    # Example: Exclude high-income cases (e.g., > $4,000)
+    high_income_threshold = 4000 # Adjusted to match the iddah calculation
+    df['is_high_income'] = df['husband_income'] > high_income_threshold
+    
+    # Filter out cases that don't fit the criteria
+    filtered_df = df[
+        (df['is_consent_order'] == False) &
+        (df['is_high_income'] == False)
+    ].copy() # Use .copy() to avoid SettingWithCopyWarning
+    
+    # Outlier detection can be done here using statistical methods (e.g., Z-score)
+    # This is a more complex step and would require specific logic based on the data distribution.
+    # For now, we assume this is a manual review step.
+    
+    return filtered_df
+
+def calculate_iddah(salary: float):
+    """
+    Calculates iddah based on the provided formula.
+    """
+    # Condition: if salary > 4000
+    if salary > 4000:
+        return {
+            "message": "Salary above $4000. Please seek legal advice (outside LAB scope)."
+        }
+
+    # Condition: if salary = 0
+    if salary == 0:
+        return {
+            "iddah": 0,
+            "lower_range": 0,
+            "upper_range": 0
+        }
+
+    # Base formula
+    base = 0.14 * salary + 47
+
+    # Rounding helper
+    def round_nearest_100(x):
+        return int(round(x / 100.0) * 100)
+
+    # Apply rounding
+    iddah = round_nearest_100(base)
+
+    # Calculate ranges
+    lower = round_nearest_100(base - 50)
+    upper = round_nearest_100(base + 150)
+
+    # Conditions: no negative values
+    if iddah < 0:
+        iddah = 0
+    if lower < 0:
+        lower = 0
+
+    return {
+        "iddah": iddah,
+        "lower_range": lower,
+        "upper_range": upper
+    }
+
+def update_formulae(df):
+    """
+    Generates and updates formulae based on the filtered data and calculates
+    Iddah based on the provided formula.
+    """
+    if df.empty:
+        print("No cases to analyze after filtering.")
+        return None, None, None
+    
+    # Apply iddah calculation to each valid case
+    iddah_results = df['husband_income'].apply(
+        lambda x: calculate_iddah(x) if pd.notnull(x) else {}
+    )
+    
+    # Extract the iddah, ranges, and messages into new columns
+    df['calculated_iddah'] = iddah_results.apply(lambda x: x.get('iddah', None))
+    df['iddah_lower_range'] = iddah_results.apply(lambda x: x.get('lower_range', None))
+    df['iddah_upper_range'] = iddah_results.apply(lambda x: x.get('upper_range', None))
+    df['iddah_message'] = iddah_results.apply(lambda x: x.get('message', None))
+
+    # Example formula update: a simple average
+    avg_nafkah = df['nafkah_iddah'].mean()
+    avg_mutaah = df['mutaah'].mean()
+    avg_iddah = df['calculated_iddah'].mean()
+    
+    print(f"Updated Nafkah Iddah Formula (Average): S${avg_nafkah:.2f}")
+    print(f"Updated Mutaah Formula (Average): S${avg_mutaah:.2f}")
+    print(f"Calculated Iddah Formula (Average): S${avg_iddah:.2f}")
+
+    return avg_nafkah, avg_mutaah, avg_iddah
+
+# --- Main execution flow ---
+if __name__ == "__main__":
+    # Create a dummy folder with a few empty PDF files for demonstration
+    dummy_dir = "syariah_cases"
+    os.makedirs(dummy_dir, exist_ok=True)
+    
+    print(f"Place your PDF case files in the '{dummy_dir}' folder.")
+    input("Press Enter to continue once you have added files...")
+    
+    # Process the files
+    clean_data = process_case_files(dummy_dir)
+    
+    if not clean_data.empty:
+        print("\n--- Processed Data ---")
+        print(clean_data)
+        
+        # Generate and update formulae
+        update_formulae(clean_data)
     else:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            text = f.read()
-    rec = {'source_file': os.path.basename(path), 'raw_text': text[:4000]}  # store sample for debugging
-    inc = find_first(RE_INCOME, text)
-    naf = find_first(RE_NAFKAH, text)
-    mut = find_first(RE_MUTAAH, text)
-    consent_flag = bool(RE_CONSENT.search(text))
-    rec.update({
-        'husband_income_raw': inc,
-        'husband_income': normalize_number(inc),
-        'nafkah_iddah_raw': naf,
-        'nafkah_iddah': normalize_number(naf),
-        'mutaah_raw': mut,
-        'mutaah': normalize_number(mut),
-        'is_consent_order': consent_flag,
-    })
-    return rec
-
-def detect_outliers_iqr(series):
-    s = series.dropna()
-    q1 = s.quantile(0.25)
-    q3 = s.quantile(0.75)
-    iqr = q3 - q1
-    low = q1 - 1.5 * iqr
-    high = q3 + 1.5 * iqr
-    return lambda x: (x < low) | (x > high)
-
-def recalibrate_formula(df, target_col='nafkah_iddah', feature_col='husband_income'):
-    # Simple linear regression: target = a + b * income
-    subset = df[[feature_col, target_col]].dropna()
-    if len(subset) < 3:
-        return None  # not enough data
-    X = subset[[feature_col]].values
-    y = subset[target_col].values
-    model = LinearRegression().fit(X, y)
-    a = float(model.intercept_)
-    b = float(model.coef_[0])
-    return {'intercept': a, 'slope': b, 'r2': float(model.score(X,y))}
-
-# ---------- main ----------
-def main(input_dir='samples', out_csv='cases_extracted.csv', high_income_threshold=10000):
-    files = glob.glob(os.path.join(input_dir, '*'))
-    records = []
-    for f in files:
-        try:
-            records.append(process_file(f))
-        except Exception as e:
-            print("Error processing", f, e)
-    df = pd.DataFrame(records)
-    # filtering flags
-    df['is_high_income'] = df['husband_income'].apply(lambda x: x is not None and x > high_income_threshold)
-    # outlier detection based on nafkah and mutaah
-    naf_outlier_fn = detect_outliers_iqr(df['nafkah_iddah'])
-    mut_outlier_fn = detect_outliers_iqr(df['mutaah'])
-    df['is_naf_outlier'] = df['nafkah_iddah'].apply(lambda x: naf_outlier_fn(x) if pd.notna(x) else False)
-    df['is_mut_outlier'] = df['mutaah'].apply(lambda x: mut_outlier_fn(x) if pd.notna(x) else False)
-    # pass_filter = not consent order, not high income, not outlier
-    df['pass_filter'] = (~df['is_consent_order']) & (~df['is_high_income']) & (~df['is_naf_outlier']) & (~df['is_mut_outlier'])
-
-    df.to_csv(out_csv, index=False)
-    print("Wrote", out_csv)
-
-    # Recalibration examples
-    naf_model = recalibrate_formula(df[df['pass_filter']], 'nafkah_iddah', 'husband_income')
-    mut_model = recalibrate_formula(df[df['pass_filter']], 'mutaah', 'husband_income')
-    print("NAF model:", naf_model)
-    print("MUT model:", mut_model)
-    return df, naf_model, mut_model
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--input', default='samples', help='folder with PDFs or txts')
-    parser.add_argument('--out', default='cases_extracted.csv')
-    parser.add_argument('--high_income', type=float, default=10000)
-    args = parser.parse_args()
-    main(args.input, args.out, args.high_income)
+        print("\nNo valid cases were found or all were filtered out.")
